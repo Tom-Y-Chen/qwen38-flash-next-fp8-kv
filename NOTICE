@@ -1,0 +1,28 @@
+Qwen3.8-Flash-Next FP8 KV Cache (experimental)
+===============================================
+
+This repository contains an experimental modification of two source files from
+NVIDIA's vLLM fork (the `qwen38-flash-dgx` container), and is an independent
+community patch. It is NOT an official product of NVIDIA or of the vLLM project.
+
+Upstream project: vLLM
+License: Apache License 2.0
+Copyright (c) the vLLM Project and its contributors.
+
+Upstream fork: NVIDIA's vLLM fork, from which the base files inside
+`patches/` are derived. The base files referenced by the patches are:
+
+  vllm/models/qwen3_8_flash_next/nvidia/qsa.py
+  vllm/models/qwen3_8_flash_next/nvidia/ops/qsa.py
+
+The model studied is:
+  Qwen3.8-Flash-Next (Qwen4ExpForConditionalGeneration) by the Qwen/Alibaba team
+  (specifically the RadixArk-NVFP4 checkpoint referenced in the README).
+  Qwen model weights are subject to their own license; this repository contains
+  NO model weights, only source patches and documentation.
+
+This repository is distributed under the Apache License 2.0. See the LICENSE
+file.
+
+This is a TEST / EXPERIMENTAL artifact. It has not been reviewed by, and is not
+supported by, vLLM or NVIDIA. Use at your own risk.

@@ -1,0 +1,13 @@
+# EXPERIMENTAL: builds an image that enables fp8 KV cache for the
+# Qwen3.8-Flash-Next QSA sparse-attention Triton kernel.
+#
+# PREREQUISITE (the base image was already a working bf16-only build):
+#   qwen38-flash-dgx        NVIDIA vLLM fork, vLLM 0.1.dev20073+g8e685d198, FA2
+# The two patched files are copied ON TOP of that base image.
+
+FROM qwen38-flash-dgx
+
+COPY patched/qsa.py     /usr/local/lib/python3.12/dist-packages/vllm/models/qwen3_8_flash_next/nvidia/qsa.py
+COPY patched/qsa_ops.py /usr/local/lib/python3.12/dist-packages/vllm/models/qwen3_8_flash_next/nvidia/ops/qsa.py
+
+WORKDIR /
