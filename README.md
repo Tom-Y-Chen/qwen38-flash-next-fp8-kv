@@ -1,5 +1,7 @@
 # Qwen3.8-Flash-Next — fp8 KV Cache (Experimental)
 
+> **中文版 →** [README.zh-CN.md](README.zh-CN.md)
+
 > **⚠️ THIS IS AN EXPERIMENT / TEST ARTIFACT, NOT A RIGOROUS OR PRODUCTION BUILD.**
 > It is a community patch, **not** an official vLLM or NVIDIA release. It was
 > validated on **one** machine (an NVIDIA DGX Spark, GB10 / sm_121) against

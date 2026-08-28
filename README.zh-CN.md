@@ -1,5 +1,7 @@
 # Qwen3.8-Flash-Next — fp8 KV Cache（实验性）
 
+> **English** → [README.md](README.md)
+
 > **⚠️ 这是一个实验 / 测试产物，不是严谨或生产构建。**
 > 这是一个社区补丁，**不是**官方 vLLM 或 NVIDIA 发布。它仅在**一台**机器（NVIDIA DGX Spark，GB10 / sm_121）上，针对**一个**固定版本的 vLLM fork 构建进行了验证。不同的 vLLM 版本、attention 后端或 GPU 可能无法工作（或可能静默回退）。fp8 scales 是**未校准的（scale = 1.0）**。风险自负。
 
