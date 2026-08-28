@@ -26,6 +26,7 @@ docker run -d --name "$NAME" --gpus all --ipc=host --shm-size 16g -p 18307:8000 
     --host 0.0.0.0 --port 8000 --load-format safetensors \
     --max-model-len 262144 --max-num-seqs 8 --gpu-memory-utilization 0.94 \
     --kv-cache-dtype "$KVD" \
+    --enable-auto-tool-choice --tool-call-parser qwen3_xml \
     --no-enable-prefix-caching --enable-chunked-prefill --max-num-batched-tokens 8192 \
     -cc.cudagraph_mode=PIECEWISE -cc.splitting_ops="$SPLIT" \
     --no-enable-flashinfer-autotune
