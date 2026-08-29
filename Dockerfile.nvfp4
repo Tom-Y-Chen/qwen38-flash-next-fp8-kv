@@ -1,0 +1,15 @@
+# EXPERIMENTAL (PAUSED): enables NVFP4 KV cache for the Qwen3.8-Flash-Next QSA
+# sparse-attention Triton kernel. Same base + two patched files as the fp8
+# build; the patched files now carry the nvfp4 write/read paths, so this image
+# serves bf16, fp8, and nvfp4 --kv-cache-dtype at runtime.
+#
+# NOTE: boot is currently BLOCKED by a vLLM-core CSA+linear allocator invariant
+# (see NVFP4-KV-EXPLORATION.md). Do not use this to serve until upstream lands
+# SM120 NVFP4 KV + the flashnext arch handler.
+
+FROM qwen38-flash-dgx
+
+COPY patched/qsa.py     /usr/local/lib/python3.12/dist-packages/vllm/models/qwen3_8_flash_next/nvidia/qsa.py
+COPY patched/qsa_ops.py /usr/local/lib/python3.12/dist-packages/vllm/models/qwen3_8_flash_next/nvidia/ops/qsa.py
+
+WORKDIR /

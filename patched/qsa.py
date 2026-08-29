@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import ClassVar, cast
 
 import torch
@@ -32,14 +33,20 @@ from vllm.utils.torch_utils import (
     _resolve_layer_name,
     canonicalize_singleton_dim_strides,
     direct_register_custom_op,
+    get_dtype_size,
     kv_cache_dtype_str_to_dtype,
+    nvfp4_kv_cache_full_dim,
+    nvfp4_split_data_scale,
 )
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
     AttentionType,
 )
-from vllm.v1.attention.backends.fa_utils import is_flash_attn_varlen_func_available
+from vllm.v1.attention.backends.fa_utils import (
+    is_flash_attn_varlen_func_available,
+    reshape_and_cache_flash,
+)
 from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionBackend,
     FlashAttentionImpl,
@@ -74,6 +81,8 @@ class Qwen3_8FlashNextQSAFlashAttentionBackend(FlashAttentionBackend):
         "fp8_e4m3",
         "fp8_e5m2",
         "fp8_per_tensor",
+        "nvfp4",
+        "nvfp4_4over6",
     ]
 
     @classmethod
@@ -105,6 +114,26 @@ class Qwen3_8FlashNextQSAFlashAttentionBackend(FlashAttentionBackend):
     @classmethod
     def supports_kv_connector(cls) -> bool:
         return False
+
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> tuple[int, ...]:
+        # NVFP4 stores K and V as separate per-head slots of packed fp4 data
+        # plus fp8 block scales, so the page is (blocks, 2*heads, block_size,
+        # full_dim).  BF16/FP8 keep the dense K+V content-packed layout.
+        if cache_dtype_str.startswith("nvfp4"):
+            return (
+                num_blocks,
+                2 * num_kv_heads,
+                block_size,
+                nvfp4_kv_cache_full_dim(head_size),
+            )
+        return (num_blocks, num_kv_heads, block_size, 2 * head_size)
 
 
 class Qwen3_8FlashNextQSAFlashAttentionImpl(FlashAttentionImpl):
@@ -139,11 +168,45 @@ class Qwen3_8FlashNextQSAFlashAttentionImpl(FlashAttentionImpl):
             "fp8_e4m3",
             "fp8_e5m2",
             "fp8_per_tensor",
+            "nvfp4",
+            "nvfp4_4over6",
         ):
             raise NotImplementedError(
-                "Qwen3.8-Flash-Next QSA requires a BF16 or FP8 main KV cache"
+                "Qwen3.8-Flash-Next QSA requires a BF16/FP8/NVFP4 main KV cache"
             )
         self.supports_quant_query_input = False
+
+    def do_kv_cache_update(
+        self,
+        layer: torch.nn.Module,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
+            return
+        if self.kv_cache_dtype.startswith("nvfp4"):
+            # (B, 2*H, N, full_dim) -> ((B, N, H, full_dim), (B, N, H, full_dim));
+            # K head-slots first, then V head-slots.
+            k_cache, v_cache = kv_cache.transpose(1, 2).split(
+                self.num_kv_heads, dim=-2
+            )
+        else:
+            # (B, H, N, 2*hs) -> ((B, N, H, hs), (B, N, H, hs))
+            k_cache, v_cache = kv_cache.transpose(1, 2).split(
+                self.head_size, dim=-1
+            )
+        reshape_and_cache_flash(
+            key,
+            value,
+            k_cache,
+            v_cache,
+            slot_mapping,
+            self.kv_cache_dtype,
+            layer._k_scale,
+            layer._v_scale,
+        )
 
     def forward_qsa(
         self,
@@ -176,6 +239,35 @@ class Qwen3_8FlashNextQSAFlashAttentionImpl(FlashAttentionImpl):
             raise RuntimeError("QSA owner did not provide its top-k buffer")
         logical_indices = topk_buffer[:num_tokens]
         token_to_req = token_to_req[:num_tokens]
+
+        if self.kv_cache_dtype.startswith("nvfp4"):
+            # NVFP4: K and V are packed as separate head-slot groups in a uint8
+            # cache of shape (num_blocks, 2*num_kv_heads, block_size, full_dim);
+            # the last dim packs fp4 data + fp8 block scales.  Split K/V on the
+            # head-slot axis (dim=1), then split data/scale for each side.
+            if query.dtype != torch.bfloat16:
+                raise NotImplementedError(
+                    "Qwen3.8-Flash-Next QSA nvfp4 requires BF16 query"
+                )
+            k_side, v_side = kv_cache.split(self.num_kv_heads, dim=1)
+            k_data, k_sf = nvfp4_split_data_scale(k_side)
+            v_data, v_sf = nvfp4_split_data_scale(v_side)
+
+            from .ops.qsa import qsa_sparse_paged_attention_nvfp4
+
+            qsa_sparse_paged_attention_nvfp4(
+                query[:num_tokens],
+                k_data,
+                k_sf,
+                v_data,
+                v_sf,
+                logical_indices,
+                attn_metadata.block_table,
+                token_to_req,
+                output[:num_tokens],
+            )
+            return output
+
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
         key_cache = canonicalize_singleton_dim_strides(key_cache)
         value_cache = canonicalize_singleton_dim_strides(value_cache)
@@ -239,9 +331,11 @@ class Qwen3_8FlashNextQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             "fp8_e4m3",
             "fp8_e5m2",
             "fp8_per_tensor",
+            "nvfp4",
+            "nvfp4_4over6",
         ):
             raise NotImplementedError(
-                "Qwen3.8-Flash-Next QSA requires a BF16 or FP8 main KV cache"
+                "Qwen3.8-Flash-Next QSA requires a BF16 / FP8 / NVFP4 main KV cache"
             )
         if getattr(quant_config, "kv_cache_scheme", None) is not None:
             raise NotImplementedError(
@@ -396,7 +490,7 @@ class Qwen3_8FlashNextQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         return self.attn_backend
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        return FullAttentionSpec(
+        spec = FullAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=self.num_kv_heads,
             head_size=self.head_dim,
@@ -404,6 +498,17 @@ class Qwen3_8FlashNextQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             dtype=self.kv_cache_torch_dtype,
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
         )
+        if spec.kv_quant_mode.is_nvfp4:
+            # NVFP4 packs K and V as separate head-slot groups of fp4 data plus
+            # fp8 block scales; mirror flashinfer's layout so the page size and
+            # the physical cache shape agree.
+            full_dim = nvfp4_kv_cache_full_dim(self.head_dim)
+            return replace(
+                spec,
+                num_head_slots=2 * self.num_kv_heads,
+                state_content_bytes=full_dim,
+            )
+        return spec
 
     def _run_qsa(
         self,

@@ -972,6 +972,113 @@ def qsa_sparse_paged_attention(
     return out
 
 
+def qsa_sparse_paged_attention_nvfp4(
+    q: torch.Tensor,
+    k_data: torch.Tensor,
+    k_sf: torch.Tensor,
+    v_data: torch.Tensor,
+    v_sf: torch.Tensor,
+    logical_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Two-pass NVFP4 QSA: gather the indexer-selected sparse K/V rows,
+    dequantize them to bf16 with flashinfer's NVFP4 kernel, then run the
+    existing BF16 paged attention kernel over a compacted fake cache.
+
+    The cache is ``(num_blocks, 2*num_kv_heads, block_size, full_dim)`` uint8
+    where the last dim packs ``data_dim`` fp4 bytes plus ``scale_dim`` fp8
+    block scales.  Pass 1 scatters the selected rows into a dense
+    ``(num_rows, TOPK, num_kv_heads, head_dim)`` bf16 buffer; pass 2 treats
+    each query row as its own cache block so the tuned splitk kernel runs
+    unchanged on dequantized bf16 K/V.
+    """
+
+    if not q.is_cuda or not HAS_TRITON:
+        raise RuntimeError("NVFP4 paged QSA sparse attention requires CUDA")
+    try:
+        from flashinfer import nvfp4_kv_dequantize
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError("NVFP4 QSA attention requires flashinfer") from exc
+
+    num_rows = q.shape[0]
+    head_dim = q.shape[2]
+    topk = logical_indices.shape[1]
+    num_kv = k_data.shape[1]
+    block_size = k_data.shape[2]
+    num_blocks = k_data.shape[0]
+    if logical_indices.ndim != 2 or logical_indices.shape[0] != num_rows:
+        raise ValueError("NVFP4 QSA indices must have one row per query")
+    if out.shape != q.shape:
+        raise ValueError("NVFP4 QSA sparse output must match its query")
+    if q.dtype != torch.bfloat16:
+        raise NotImplementedError("NVFP4 QSA requires a BF16 query and output")
+    if k_data.dtype != v_data.dtype != torch.uint8:
+        raise ValueError("NVFP4 K/V data must be packed uint8")
+    if num_rows == 0 or topk <= 0:
+        out.zero_()
+        return out
+
+    # -- Pass 1: gather the indexer-selected rows and dequantize to bf16 ----
+    req_ids = token_to_req.clamp(min=0, max=block_table.shape[0] - 1)
+    tok = logical_indices.clamp(min=0)
+    page_idx = tok // block_size
+    page_off = tok % block_size
+    table_width = block_table.shape[1]
+    safe_page_idx = page_idx.clamp(max=table_width - 1)
+    phys_page = block_table[req_ids[:, None], safe_page_idx]
+    valid = (logical_indices >= 0) & (phys_page >= 0) & (phys_page < num_blocks)
+    sel_page = phys_page.clamp(min=0, max=num_blocks - 1)
+    sel_off = page_off.clamp(min=0, max=block_size - 1)
+
+    def _gather(store, is_scaled):
+        # (num_blocks, num_kv, block_size, dim) -> (R, TOPK, num_kv, dim)
+        g = store[sel_page, :, sel_off]
+        g = g.reshape(num_rows * topk * num_kv, -1)
+        # flashinfer's dequant expects the fp8 block-scales as raw bytes.
+        return g.view(torch.uint8) if is_scaled else g
+
+    k_data_g = _gather(k_data, False)
+    k_scale_g = _gather(k_sf, True)
+    v_data_g = _gather(v_data, False)
+    v_scale_g = _gather(v_sf, True)
+
+    global_scale = torch.ones(1, dtype=torch.float32, device=q.device)
+    per_side = (num_rows, topk, num_kv)
+    k_rows = nvfp4_kv_dequantize(k_data_g, k_scale_g, global_scale).view(
+        *per_side, head_dim
+    )
+    v_rows = nvfp4_kv_dequantize(v_data_g, v_scale_g, global_scale).view(
+        *per_side, head_dim
+    )
+
+    # -- Pass 2: reuse the BF16 paged kernel over a compacted fake cache -----
+    k_cache = k_rows.contiguous()  # (R, TOPK, num_kv, head_dim)
+    v_cache = v_rows.contiguous()
+    fake_indices = torch.where(
+        valid,
+        torch.arange(topk, dtype=logical_indices.dtype, device=q.device),
+        -1,
+    ).contiguous()
+    fake_table = torch.arange(
+        num_rows, dtype=block_table.dtype, device=q.device
+    ).reshape(num_rows, 1).contiguous()
+    fake_req = torch.arange(num_rows, dtype=torch.int32, device=q.device)
+
+    return qsa_sparse_paged_attention(
+        q,
+        k_cache,
+        v_cache,
+        fake_indices,
+        fake_table,
+        fake_req,
+        out,
+        k_scale=1.0,
+        v_scale=1.0,
+    )
+
+
 def qsa_store_cache_rows(
     cache: torch.Tensor,
     slot_mapping: torch.Tensor,
